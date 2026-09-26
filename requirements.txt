@@ -3,5 +3,5 @@ scipy>=1.10
 pandas>=2.0
 plotly>=5.20
 streamlit>=1.45
-obspy>=1.4        # real data from FDSN servers (Raspberry Shake, EarthScope, GEOFON)
+obspy>=1.4        # downloads real data from FDSN servers (Raspberry Shake, EarthScope, GEOFON)
 pytest>=7         # tests only

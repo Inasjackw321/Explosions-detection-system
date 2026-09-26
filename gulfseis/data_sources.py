@@ -1,21 +1,30 @@
 """Real data from public FDSN web services (needs ObsPy + internet).
 
 * Raspberry Shake community network ("AM", data.raspberryshake.org)
-  - RS1D/RS3D/RS4D/RS&BOOM: EHZ vertical geophone, HDF infrasound (RS&BOOM)
-* EarthScope (IRIS) - global networks (II, IU, ...), temporary deployments
+  - RS1D/RS3D/RS4D: EHZ vertical geophone; RS&BOOM: EHZ + HDF infrasound;
+    RBOOM: HDF only
+* EarthScope (IRIS) - global and regional networks
 * GEOFON (GFZ) - GE network and partners
 * USGS / EMSC event catalogues for cross-checking.
+
+Stations are searched in the box around the monitored polygon and kept when
+they are inside it or within `station_buffer_km` of its outline.
 """
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import region as reg
 from .config import DATA_CENTERS, INFRASOUND_CHANNELS, SEISMIC_CHANNEL_PREFERENCE
-from .geo import haversine_km
+from .geo import KM_PER_DEG, haversine_km
 from .models import CatalogEvent, Station, Waveform
+
+TARGET_FS = 50.0      # Hz; enough for 1-20 Hz explosions and keeps long windows light
 
 
 def obspy_available() -> bool:
@@ -26,139 +35,202 @@ def obspy_available() -> bool:
         return False
 
 
-def _client(key, timeout=60):
+def _client(key, timeout=120):
     from obspy.clients.fdsn import Client
     return Client(key, timeout=timeout)
 
 
-def discover_stations(center_keys, region, t_start, t_end, include_infrasound=True,
-                      max_stations=40, log=print):
-    """Find stations with a vertical seismic channel (and infrasound) in the region.
+@dataclass
+class StationStatus:
+    station: Station
+    dist_to_area_km: float = 0.0
+    ok: bool = False
+    channels: list = field(default_factory=list)
+    error: str = ""
+    seconds_requested: float = 0.0
+    seconds_with_data: float = 0.0
 
-    Returns (stations, inventories) where inventories maps station id -> (client key, Inventory).
-    """
-    from obspy import UTCDateTime
-
-    channels = ",".join(SEISMIC_CHANNEL_PREFERENCE + (INFRASOUND_CHANNELS if include_infrasound else []))
-    found: dict[str, Station] = {}
-    inventories = {}
-    for key in center_keys:
-        try:
-            inv = _client(key).get_stations(
-                minlatitude=region["min_lat"], maxlatitude=region["max_lat"],
-                minlongitude=region["min_lon"], maxlongitude=region["max_lon"],
-                channel=channels, starttime=UTCDateTime(t_start), endtime=UTCDateTime(t_end),
-                level="response")
-        except Exception as exc:  # no data / service down / no network
-            log(f"{key}: station query failed ({exc.__class__.__name__}: {str(exc)[:120]})")
-            continue
-        n_before = len(found)
-        for net in inv:
-            for sta in net:
-                sid = f"{net.code}.{sta.code}"
-                if sid in found:
-                    continue
-                chans = {c.code: c for c in sta.channels}
-                seis = next((c for c in SEISMIC_CHANNEL_PREFERENCE if c in chans), None)
-                if seis is None:
-                    continue
-                infra = next((c for c in INFRASOUND_CHANNELS if c in chans), None)
-                is_rs = key == "RASPISHAKE" or net.code == "AM"
-                kind = ("Raspberry Shake & Boom" if infra else "Raspberry Shake") if is_rs else "Broadband"
-                found[sid] = Station(
-                    network=net.code, code=sta.code, lat=sta.latitude, lon=sta.longitude,
-                    elevation=sta.elevation, location=chans[seis].location_code, channel=seis,
-                    kind=kind, source=key, infrasound_channel=infra,
-                    site=(sta.site.name or "") if sta.site else "")
-                inventories[sid] = (key, inv)
-        log(f"{key}: {len(found) - n_before} stations")
-    stations = list(found.values())
-    if len(stations) > max_stations:
-        # keep the stations closest to the region centre, but spread out
-        clat = (region["min_lat"] + region["max_lat"]) / 2
-        clon = (region["min_lon"] + region["max_lon"]) / 2
-        stations.sort(key=lambda s: float(haversine_km(clat, clon, s.lat, s.lon)))
-        stations = stations[:max_stations]
-    return stations, inventories
+    @property
+    def availability(self) -> float:
+        """Fraction of the requested time that had data."""
+        return self.seconds_with_data / self.seconds_requested if self.seconds_requested else 0.0
 
 
-def _fetch_one(sta: Station, client, inv, t_start, t_end, target_fs=100.0):
-    from obspy import UTCDateTime
+class DataFetcher:
+    """Finds stations once, then downloads any time window (thread-safe caches)."""
 
-    out = []
-    chans = [(sta.channel, "VEL", "m/s")]
-    if sta.infrasound_channel:
-        chans.append((sta.infrasound_channel, "DEF", "Pa"))
-    for cha, output, units in chans:
-        st = client.get_waveforms(sta.network, sta.code, sta.location or "*", cha,
-                                  UTCDateTime(t_start), UTCDateTime(t_end))
-        if not len(st):
-            continue
-        st.merge(method=1, fill_value="interpolate")
-        tr = st[0]
-        fs = tr.stats.sampling_rate
-        tr.detrend("linear")
-        tr.remove_response(inventory=inv, output=output, water_level=60,
-                           pre_filt=(0.2, 0.4, 0.40 * fs, 0.48 * fs))
-        if fs > target_fs * 1.01:
-            tr.resample(target_fs)
-        out.append(Waveform(sta, cha, tr.stats.starttime.timestamp, tr.stats.sampling_rate,
-                            tr.data.astype(np.float64), units))
-    return out
+    def __init__(self, center_labels, settings, include_infrasound=True, log=print):
+        self.keys = [DATA_CENTERS[c] for c in center_labels]
+        self.settings = settings
+        self.include_infrasound = include_infrasound
+        self.log = log
+        self.clients = {}
+        self.stations: list[Station] = []
+        self.status: dict[str, StationStatus] = {}
+        self._responses = {}
+        self._lock = threading.Lock()
 
+    # ---------------------------------------------------------------- stations
+    def discover(self, t_start, t_end, max_stations=150):
+        from obspy import UTCDateTime
 
-def fetch_waveforms(stations, inventories, t_start, t_end, log=print, progress=None, workers=8):
-    """Download and instrument-correct waveforms (m/s, Pa) in parallel."""
-    waveforms = []
-    done = 0
-    clients = {}
-    for key in {inventories[s.id][0] for s in stations}:
-        try:
-            clients[key] = _client(key, timeout=90)
-        except Exception as exc:
-            log(f"{key}: cannot connect ({exc.__class__.__name__})")
-    stations = [s for s in stations if inventories[s.id][0] in clients]
-    if not stations:
-        return waveforms
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_fetch_one, s, clients[inventories[s.id][0]], inventories[s.id][1],
-                          t_start, t_end): s for s in stations}
-        for fut in as_completed(futs):
-            s = futs[fut]
-            done += 1
+        s = self.settings
+        pad = s.station_buffer_km / KM_PER_DEG + 0.5
+        box = reg.bbox(s.polygon, pad)
+        chans = SEISMIC_CHANNEL_PREFERENCE + (INFRASOUND_CHANNELS if self.include_infrasound else [])
+        found: dict[str, Station] = {}
+        for key in self.keys:
             try:
-                w = fut.result()
-                waveforms.extend(w)
-                if not w:
-                    log(f"{s.id}: no data")
+                client = self.clients.get(key) or _client(key)
+                self.clients[key] = client
+                inv = client.get_stations(
+                    network="AM" if key == "RASPISHAKE" else "*",
+                    minlatitude=box["min_lat"], maxlatitude=box["max_lat"],
+                    minlongitude=box["min_lon"], maxlongitude=box["max_lon"],
+                    channel=",".join(chans), starttime=UTCDateTime(t_start),
+                    endtime=UTCDateTime(t_end), level="channel")
             except Exception as exc:
-                log(f"{s.id}: download failed ({exc.__class__.__name__}: {str(exc)[:100]})")
-            if progress:
-                progress(done / len(futs), f"Downloaded {done}/{len(futs)} stations")
-    return waveforms
+                self.log(f"{key}: station search failed - {_short(exc)}")
+                continue
+            n0 = len(found)
+            for net in inv:
+                for sta in net:
+                    sid = f"{net.code}.{sta.code}"
+                    if sid in found:
+                        continue
+                    codes = {}
+                    for c in sta.channels:      # prefer location "00" / "" and the first listed
+                        codes.setdefault(c.code, c)
+                    seis = next((c for c in SEISMIC_CHANNEL_PREFERENCE if c in codes), None)
+                    infra = next((c for c in INFRASOUND_CHANNELS if c in codes), None) \
+                        if self.include_infrasound else None
+                    if seis is None and infra is None:
+                        continue
+                    d = reg.distance_km(sta.latitude, sta.longitude, s.polygon)
+                    if d > s.station_buffer_km:
+                        continue
+                    is_rs = key == "RASPISHAKE" or net.code == "AM"
+                    if is_rs:
+                        kind = ("Raspberry Shake & Boom" if infra and seis else
+                                "Raspberry Boom (infrasound only)" if infra else "Raspberry Shake")
+                    else:
+                        kind = "Broadband"
+                    ch = codes[seis or infra]
+                    found[sid] = Station(
+                        network=net.code, code=sta.code, lat=sta.latitude, lon=sta.longitude,
+                        elevation=sta.elevation, location=ch.location_code, channel=seis or "",
+                        kind=kind, source=key, infrasound_channel=infra,
+                        site=(sta.site.name or "") if sta.site else "")
+                    self.status[sid] = StationStatus(found[sid], d)
+            self.log(f"{key}: {len(found) - n0} stations in or near the area")
+        stations = sorted(found.values(), key=lambda x: self.status[x.id].dist_to_area_km)
+        if len(stations) > max_stations:
+            self.log(f"Using the {max_stations} stations closest to the area (of {len(stations)}).")
+            stations = stations[:max_stations]
+        self.stations = stations
+        return stations
+
+    # ---------------------------------------------------------------- waveforms
+    def _response(self, sta: Station, t1, t2):
+        from obspy import UTCDateTime
+
+        with self._lock:
+            inv = self._responses.get(sta.id)
+        if inv is None:
+            chans = ",".join(c for c in (sta.channel, sta.infrasound_channel) if c)
+            inv = self.clients[sta.source].get_stations(
+                network=sta.network, station=sta.code, location=sta.location or "*", channel=chans,
+                starttime=UTCDateTime(t1), endtime=UTCDateTime(t2), level="response")
+            with self._lock:
+                self._responses[sta.id] = inv
+        return inv
+
+    def _fetch_one(self, sta: Station, t1, t2):
+        from obspy import UTCDateTime
+
+        client = self.clients[sta.source]
+        inv = self._response(sta, t1, t2)
+        out, avail = [], []
+        for cha, output, units in ((sta.channel, "VEL", "m/s"), (sta.infrasound_channel, "DEF", "Pa")):
+            if not cha:
+                continue
+            st = client.get_waveforms(sta.network, sta.code, sta.location or "*", cha,
+                                      UTCDateTime(t1), UTCDateTime(t2))
+            if not len(st):
+                continue
+            fs = st[0].stats.sampling_rate
+            n_have = sum(tr.stats.npts for tr in st)
+            avail.append(min(n_have / max((t2 - t1) * fs, 1), 1.0))
+            st.merge(method=1, fill_value="interpolate")   # bridge short gaps
+            tr = st[0]
+            tr.detrend("demean")
+            tr.remove_response(inventory=inv, output=output, water_level=60,
+                               pre_filt=(0.1, 0.3, 0.40 * fs, 0.48 * fs))
+            if fs > TARGET_FS * 1.01:
+                tr.filter("lowpass", freq=0.4 * TARGET_FS, corners=8, zerophase=True)
+                factor = int(round(fs / TARGET_FS))
+                if abs(fs / factor - TARGET_FS) < 1e-6:
+                    tr.decimate(factor, no_filter=True)
+                else:
+                    tr.resample(TARGET_FS, no_filter=True)
+            out.append(Waveform(sta, cha, tr.stats.starttime.timestamp, tr.stats.sampling_rate,
+                                tr.data.astype(np.float64), units))
+        return out, (float(np.mean(avail)) if avail else 0.0)
+
+    def fetch(self, t1, t2, progress=None, workers=8):
+        """Download + instrument-correct all stations for [t1, t2] (m/s and Pa)."""
+        waveforms = []
+        stations = [s for s in self.stations if s.source in self.clients]
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(self._fetch_one, s, t1, t2): s for s in stations}
+            for fut in as_completed(futs):
+                s = futs[fut]
+                stat = self.status[s.id]
+                done += 1
+                stat.seconds_requested += t2 - t1
+                try:
+                    w, a = fut.result()
+                    waveforms.extend(w)
+                    stat.seconds_with_data += a * (t2 - t1)
+                    stat.channels = sorted({*stat.channels, *(x.channel for x in w)})
+                    if w:
+                        stat.ok = True
+                        if stat.error == "no data in this time window":
+                            stat.error = ""
+                    elif not stat.ok:
+                        stat.error = "no data in this time window"
+                except Exception as exc:
+                    if not stat.ok:
+                        stat.error = _short(exc)
+                if progress:
+                    progress(done / max(len(futs), 1), f"Downloaded {done}/{len(futs)} stations")
+        return waveforms
 
 
-def fetch_catalog(region, t_start, t_end, log=print, local_min_mag=2.0, global_min_mag=5.0):
-    """Earthquakes/explosions from USGS (+EMSC): regional small events + large global ones."""
+def _short(exc) -> str:
+    msg = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+    name = exc.__class__.__name__
+    if "No data" in msg or "204" in msg or name == "FDSNNoDataException":
+        return "no data available"
+    return f"{name}: {msg[:140]}"
+
+
+def fetch_catalog(settings, t_start, t_end, log=print, local_min_mag=1.5, global_min_mag=5.0):
+    """Earthquakes/explosions from USGS and EMSC: small events near the area + large global ones."""
     from obspy import UTCDateTime
 
+    box = reg.bbox(settings.polygon, 3.0)
+    near = dict(minlatitude=box["min_lat"], maxlatitude=box["max_lat"],
+                minlongitude=box["min_lon"], maxlongitude=box["max_lon"], minmagnitude=local_min_mag)
     events = []
-    queries = [
-        ("USGS", dict(minlatitude=region["min_lat"] - 3, maxlatitude=region["max_lat"] + 3,
-                      minlongitude=region["min_lon"] - 3, maxlongitude=region["max_lon"] + 3,
-                      minmagnitude=local_min_mag)),
-        ("USGS", dict(minmagnitude=global_min_mag)),
-        ("EMSC", dict(minlatitude=region["min_lat"] - 3, maxlatitude=region["max_lat"] + 3,
-                      minlongitude=region["min_lon"] - 3, maxlongitude=region["max_lon"] + 3,
-                      minmagnitude=local_min_mag)),
-    ]
-    for key, q in queries:
+    for key, q in (("USGS", near), ("USGS", dict(minmagnitude=global_min_mag)), ("EMSC", near)):
         try:
-            cat = _client(key).get_events(starttime=UTCDateTime(t_start - 3600),
-                                          endtime=UTCDateTime(t_end), **q)
+            cat = _client(key, 60).get_events(starttime=UTCDateTime(t_start - 3600),
+                                              endtime=UTCDateTime(t_end), **q)
         except Exception as exc:
-            if "No data" not in str(exc) and "204" not in str(exc):
-                log(f"{key} catalogue: {exc.__class__.__name__}: {str(exc)[:100]}")
+            if _short(exc) != "no data available":
+                log(f"{key} catalogue: {_short(exc)}")
             continue
         for e in cat:
             o = e.preferred_origin() or (e.origins[0] if e.origins else None)
@@ -170,23 +242,9 @@ def fetch_catalog(region, t_start, t_end, log=print, local_min_mag=2.0, global_m
                 o.time.timestamp, o.latitude, o.longitude, (o.depth or 0) / 1000.0,
                 m.mag if m else float("nan"), m.magnitude_type if m else "",
                 str(e.event_type or "earthquake"), key, desc))
-    # de-duplicate (same event from two agencies)
     events.sort(key=lambda c: c.time)
     unique = []
     for c in events:
         if not any(abs(c.time - u.time) < 20 and haversine_km(c.lat, c.lon, u.lat, u.lon) < 100 for u in unique):
             unique.append(c)
     return unique
-
-
-def load_real_data(center_labels, region, t_start, t_end, include_infrasound=True,
-                   max_stations=40, with_catalog=True, log=print, progress=None):
-    """One call that does everything for the app."""
-    keys = [DATA_CENTERS[c] for c in center_labels]
-    stations, invs = discover_stations(keys, region, t_start, t_end, include_infrasound,
-                                       max_stations, log)
-    if not stations:
-        return [], [], []
-    waveforms = fetch_waveforms(stations, invs, t_start, t_end, log, progress)
-    catalog = fetch_catalog(region, t_start, t_end, log) if with_catalog else []
-    return stations, waveforms, catalog

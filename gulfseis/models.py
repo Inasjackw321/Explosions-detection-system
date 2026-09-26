@@ -136,6 +136,13 @@ class DetectedEvent:
     notes: list = field(default_factory=list)
     phases: list = field(default_factory=list)       # trial phase labels (association only)
     residuals: list = field(default_factory=list)
+    # "network" (>= 4 stations, full location), "small" (2-3 stations, location = area),
+    # "acoustic" (air-pressure sensors), "single" (one seismo-acoustic station), "distant"
+    tier: str = "network"
+    in_region: bool = True
+    feasible_lat: list = field(default_factory=list)   # possible source area (small events)
+    feasible_lon: list = field(default_factory=list)
+    ring: tuple | None = None                          # (station, d_min_km, d_max_km) for single-station
 
     @property
     def stations(self) -> list:
@@ -152,5 +159,5 @@ class DetectedEvent:
 
     @property
     def icon(self) -> str:
-        return {"Likely explosion": "💥", "Likely earthquake": "🌍",
-                "Distant earthquake": "🌐"}.get(self.label, "❓")
+        return {"Likely explosion": "💥", "Possible explosion": "💥", "Likely earthquake": "🌍",
+                "Possible earthquake": "🌍", "Distant earthquake": "🌐"}.get(self.label, "❓")

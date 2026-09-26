@@ -127,13 +127,16 @@ def detect_station(wf: Waveform, p: DetectionParams, fmin=None, fmax=None):
     cft = sta_lta(filt, fs, p.sta, p.lta)
     picks = []
     edge = int(3 * fs)
+    # the first LTA window + edge taper is not trustworthy (LTA still filling up)
+    edge_start = int((2 * p.lta + p.sta + 20.0) * fs)
     for i_on, i_off in trigger_onsets(cft, p.trigger_on, p.trigger_off, int(0.3 * fs)):
-        if i_on < edge or i_on > len(filt) - edge:
+        if i_on < edge_start or i_on > len(filt) - edge:
             continue
-        # refine onset with AIC in a window around the trigger
+        # refine onset with AIC in a window around the trigger; the causal filter is
+        # used because the zero-phase one leaks energy ahead of strong, sharp onsets
         a = max(i_on - int(2.5 * fs), 0)
         b = min(i_on + int(1.0 * fs), len(filt))
-        i_pick = a + aic_pick(filt[a:b])
+        i_pick = a + aic_pick(causal[a:b])
         noise = filt[max(i_pick - int(p.lta * fs), 0):i_pick]
         sig = filt[i_pick:i_off + 1]
         if not len(sig) or not len(noise):

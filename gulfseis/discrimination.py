@@ -46,6 +46,11 @@ def ps_ratio_evidence(log_ps: list[float]) -> Evidence | None:
 
 
 def depth_evidence(ev: DetectedEvent) -> Evidence:
+    if not ev.depth_constrained and ev.depth_min >= 3:
+        return Evidence("Source depth", f"{ev.depth:.0f} km (95%: at least {ev.depth_min:.0f} km deep)",
+                        -1.0 if ev.depth_min < 6 else -2.0, WEIGHTS["Source depth"],
+                        "The exact depth is uncertain, but the source is clearly below the surface, "
+                        "where explosions do not happen.")
     if not ev.depth_constrained:
         return Evidence("Source depth", f"{ev.depth:.0f} km (poorly constrained: "
                         f"{ev.depth_min:.0f}-{ev.depth_max:.0f} km)", 0.0, WEIGHTS["Source depth"],

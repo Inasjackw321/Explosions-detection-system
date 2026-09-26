@@ -1,15 +1,22 @@
-# GulfSeis – Explosion & Earthquake Monitor for the Persian Gulf
+# GulfSeis – Explosion & Noise Monitor for the Persian Gulf
 
-A Python app that uses public seismographs around the Persian (Arabian) Gulf, including
-**Raspberry Shake** citizen seismometers and **Raspberry Shake & Boom** infrasound sensors, to
-**detect, locate, size and classify** seismic events:
+A Python app that downloads **real recordings** from public seismometers and infrasound microphones
+in and around the Persian (Arabian) Gulf. It then sorts every signal inside the monitored area into
+one of these:
 
-- 💥 **explosions**: surface blasts, industrial accidents, quarry blasts
-- 🌍 **local and regional earthquakes**: Zagros, Makran, Oman mountains …
-- 🌐 **distant earthquakes**: Afghanistan, Turkey, Indonesia … (direction, distance, catalogue match)
+- 💥 **Likely / possible explosion**
+- 🌍 **Earthquake**
+- ❓ **Uncertain**
+- 🔇 **Noise**: a trigger at one station that nothing confirms, such as traffic, machinery, wind or people.
 
-Every step uses standard seismological formulas, and the app shows each one with the
-measured numbers plugged in.
+Events whose source is outside the area, such as inland Zagros or distant earthquakes, are listed
+separately.
+
+The **monitored area** is the green outline. It covers all of Kuwait and the head of the Gulf
+(Basrah, Faw, Abadan, Bandar Mahshahr), runs down the Iranian coast to the Strait of Hormuz and the Gulf
+of Oman (Sohar), then back along the UAE, Qatar, Bahrain and Saudi coasts. By default, events up to
+50 km beyond the outline also count; you can change this in the sidebar. The outline is defined in
+`gulfseis/region.py`.
 
 ## Open the app
 
@@ -18,77 +25,101 @@ pip install -r requirements.txt
 python run_app.py
 ```
 
-The app opens in your web browser at http://localhost:8501. You can also start it by
-double-clicking `start_windows.bat` on Windows or running `./start_mac_linux.sh` on macOS/Linux.
-On first run, `run_app.py` installs the requirements if Streamlit is missing.
+The app opens in your browser at http://localhost:8501. You can also double-click
+`start_windows.bat` on Windows or run `./start_mac_linux.sh` on macOS/Linux. It needs internet access
+to the data centres.
 
-There are two data modes (sidebar):
+### Three ways to look
 
-| Mode | Needs | What it does |
-|---|---|---|
-| **Demo** | nothing (works offline) | Simulates 19 stations around the Gulf (network code `XX`) recording an explosion, a Zagros earthquake and a distant Hindu Kush earthquake. You can also build your own test event. |
-| **Real data** | internet + ObsPy | Finds stations in the region on the Raspberry Shake (`AM`), EarthScope/IRIS and GEOFON FDSN servers, downloads and instrument-corrects the data, and cross-checks events against USGS/EMSC catalogues. Optional auto-refresh. |
+| Mode | Use it for |
+|---|---|
+| **Recent hours** | the last 1–24 h, with optional auto-refresh |
+| **Time range** | any past period of up to 24 h |
+| **Check a known event** | you know roughly *when* and *where* something happened, for example an explosion near Kuwait. The app shows whether it was detected. If it wasn't, it shows each station's signal/noise at the moment the waves should have arrived, and plots every recording with the predicted P, S and air-wave arrival times. |
 
-Command line (no GUI): `python -m gulfseis --demo` or `python -m gulfseis --real 30`.
+You can enter and display times in UTC, Kuwait/Saudi/Qatar/Bahrain/Iraq time (UTC+3), Iran time
+(UTC+3:30) or UAE/Oman time (UTC+4).
 
-## What you see
+Command line: `python -m gulfseis --hours 3`, or
+`python -m gulfseis --at "2026-09-26 10:25" --utc-offset 3`.
 
-- **Event cards**: verdict, explosion probability, time, magnitude and location in words
-  (for example "near Asaluyeh").
-- **Map**: stations (▲ seismometer, ◆ + infrasound), events (★ explosion, ● earthquake),
-  95 % location-uncertainty ring, and the direction arrow to distant earthquakes.
-- **Waveforms**: a record section (seismograms ordered by distance, with predicted P/S curves),
-  an air-blast section for infrasound, and a per-station view of the STA/LTA trigger at work.
-- **Event analysis**: an explosion-probability gauge, a bar chart of the clues behind the verdict,
-  a travel-time check, magnitude per station, energy, TNT-equivalent yield, and air-blast celerities.
-- **Formulas**: every formula, with worked examples from the detected events.
-- **Stations & triggers**: station table, every trigger, a CSV download of the events, and a
-  demo answer key.
+## Data sources
 
-## How it works
+- **Raspberry Shake** citizen network (`AM`): RS1D/3D/4D seismometers (EHZ) and Raspberry Shake &
+  Boom / Raspberry Boom infrasound (HDF).
+- **EarthScope / IRIS** and **GEOFON**: permanent and temporary networks.
+- **USGS / EMSC** catalogues, used to cross-check events.
 
-1. **Detection**: Butterworth band-pass filter, then an STA/LTA energy-ratio trigger.
-   The onset is refined with the AIC picker.
-2. **Association**: phase-free grid association decides which triggers at which stations
-   belong to one source, and whether each is a P or an S wave.
-3. **Location**: grid search over latitude, longitude and depth in a one-layer crust over a mantle
-   model (Pg/Pn, Sg/Sn). It gives 95 % χ² confidence regions for the epicentre and the depth.
-4. **Distant events**: a world-wide grid search with iasp91 P travel times gives the direction,
-   distance and apparent velocity.
-5. **Magnitude**: simulated Wood-Anderson amplitude and the IASPEI (Hutton & Boore) M_L formula.
-   Energy comes from log E = 1.5 M + 4.8. Yield comes from M = 4.45 + 0.75 log Y, with a
-   surface-coupling factor calibrated on the Beirut 2020 explosion.
-6. **Discrimination**: evidence scores are combined with the logistic formula
-   P = 1/(1+e^−z). The clues are the P/S amplitude ratio (4–12 Hz), depth,
-   first-motion polarity, an air-blast arrival at the speed of sound (infrasound or air-coupled),
-   a catalogue match, and the time of day.
+The app searches for stations inside the outline and up to 150 km outside it (adjustable). It removes
+each instrument's response, so seismic data are in m/s and infrasound in Pa, and resamples everything
+to 50 Hz. Long periods are processed in 1-hour chunks with overlap, so slow air waves are not lost.
+
+## How signals are classified
+
+1. **Trigger**: a band-pass filter, then STA/LTA on every seismometer and every infrasound microphone.
+   Very noisy stations keep only their strongest triggers.
+2. **Coincidence**: a real event reaches different stations within (distance ÷ wave speed) of each
+   other. Triggers that nothing else confirms are **noise**.
+3. **Detection, depending on how many stations saw it**:
+   - 4 or more stations: full location, including depth, with a 95 % uncertainty region.
+   - 2–3 stations: the possible **source area** inside the outline, shown shaded on the map.
+     Two-station detections must be strong and close together.
+   - Infrasound: the air wave arriving at microphones is located at the speed of sound.
+   - One Raspberry Shake & Boom: the delay between the ground wave and the air wave gives the distance,
+     d = Δt / (1/c − 1/Vp). It cannot give the direction.
+   - **Network stacking (brightness)**, for events too weak to trigger enough stations. Every station's
+     STA/LTA is shifted by the predicted P and S travel times from each trial source and added up.
+     Subtracting the largest term means one station alone can never make an event:
+
+         B(x,t) = Σᵢ [cᵢ(t+T_P,i) + cᵢ(t+T_S,i)] − maxᵢ(…)
+
+     A peak above the threshold, with support from 3 stations (or 2 stations that each show both a P and
+     an S wave), is an event, even if no station triggered on its own.
+   - One station only: very strong signals, or a P then S pair, are listed as **unconfirmed
+     single-station signals**. The S–P time gives a possible distance (d ≈ 8.3 km per second of
+     S−P), drawn as a ring on the map.
+4. **Explosion or earthquake**: the evidence is combined with P = 1/(1+e^−z). It comes from the air
+   wave, the P/S amplitude ratio, depth, first motion, a catalogue match and the time of day. Events
+   seen by few stations are labelled "Possible".
+5. **Size**: local magnitude M_L (IASPEI), energy, and a TNT-equivalent yield.
+
+The **Formulas** tab shows every formula with the detected events' numbers.
+
+## Why a known explosion might be missed
+
+- No public station close enough, or those stations were offline. Check the **Stations & data** tab
+  (✅/❌ and data coverage).
+- The time zone or time window is wrong. Air waves arrive minutes after the ground wave.
+- The site is very noisy. Use **High** sensitivity in *Check a known event* mode.
 
 ## Project layout
 
 ```
-app.py                  Streamlit user interface
-run_app.py              launcher (python run_app.py)
+app.py                  Streamlit interface          run_app.py   launcher
 gulfseis/
-  config.py             region, Earth model, detection settings, data centres
-  physics.py            travel times, magnitude, energy, yield (all formulas)
-  detection.py          filtering, STA/LTA, AIC picker, first motion
-  location.py           association, local grid search, distant-event locator
-  discrimination.py     explosion vs earthquake evidence and scoring
-  pipeline.py           detect → associate → locate → size → classify
-  data_sources.py       FDSN (Raspberry Shake, EarthScope, GEOFON), USGS/EMSC catalogues
-  synthetic.py          realistic simulated data for the demo
-  places.py             reference towns for "23 km SW of Bushehr"-style descriptions
-static/topojson/        bundled map outlines (MIT, from plotly/sane-topojson) so the map works offline
-tests/                  pytest suite (python -m pytest)
+  region.py             the monitored polygon (point-in-polygon, distance, grid)
+  data_sources.py       FDSN station search, download, response removal, catalogues
+  monitor.py            chunked processing of long periods
+  pipeline.py           detect → associate → locate → classify (network, small, air, single)
+  stacking.py           network stacking ("brightness") detector
+  detection.py          filters, STA/LTA, AIC picker, first motion
+  location.py           grid-search and distant-event locators
+  discrimination.py     explosion vs earthquake evidence
+  physics.py            travel times, magnitude, energy, yield
+static/topojson/        bundled map outlines (MIT, plotly/sane-topojson)
+tests/                  pytest suite
 ```
+
+`tests/sim.py` and `tests/fake_fdsn.py` produce simulated recordings. **Only the tests use them**, to
+check the processing and the whole download path without internet. The app itself only ever uses
+real data.
 
 ## Limitations
 
-- Public station coverage in the region is uneven. Events seen by fewer than 4 stations
-  (usually below about ML 2.5) are not located; they stay listed as unassociated triggers.
-- The Earth model is a simple average crust. Expect location errors of about 5–20 km inside
-  the network, and larger errors outside it.
-- The discrimination is probabilistic and the yield estimates are order-of-magnitude.
-  Confirm important events with official agencies (USGS, EMSC, national seismological centres).
-- Raspberry Shake servers may limit request sizes. If downloads fail, reduce the station count
-  or the time window.
+- Public station coverage around the Gulf is uneven. At the head of the Gulf only a few stations
+  (for example Basrah) may be online. An event that only one station recorded cannot be located, and
+  appears as an unconfirmed single-station signal.
+- Locations from 2–3 stations are areas, and single-station detections give only a distance.
+- An air-only detection can also be thunder, a sonic boom or another loud sound.
+- Yield estimates are order-of-magnitude. Confirm important events with official agencies (KNSN, IRSC,
+  NCM, USGS, EMSC).

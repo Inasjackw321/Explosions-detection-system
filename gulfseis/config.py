@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Persian Gulf / Arabian Gulf study area (matches the map: Basrah -> Oman,
-# Riyadh -> Kerman).  Degrees.
-DEFAULT_REGION = {"min_lat": 22.0, "max_lat": 33.0, "min_lon": 45.0, "max_lon": 60.0}
+from .region import GULF_POLYGON, bbox
+
+# Bounding box of the monitored polygon (see region.py).  The locator searches
+# this box plus a margin; events outside the polygon are reported as "outside".
+DEFAULT_REGION = bbox(GULF_POLYGON)
 
 # FDSN data centres that serve stations in / around the Gulf.  Keys are the
 # ObsPy short names.
@@ -51,17 +53,33 @@ class DetectionParams:
     lta: float = 20.0           # long-term average window (s)
     trigger_on: float = 4.0     # STA/LTA ratio that starts a trigger
     trigger_off: float = 1.5    # STA/LTA ratio that ends a trigger
-    min_stations: int = 4       # stations needed to declare an event (3 = no error check)
+    min_stations: int = 4       # stations needed for a fully located event
+    small_min_stations: int = 2 # stations needed for a small-network detection
     pick_sigma: float = 0.6     # assumed P pick uncertainty (s)
     max_rms: float = 2.0        # max RMS travel-time residual for a good location (s)
     infrasound_band: tuple = (1.0, 8.0)
     celerity_min: float = 0.26  # slowest plausible infrasound celerity (km/s)
     celerity_max: float = 0.36  # fastest plausible infrasound celerity (km/s)
     max_air_range_km: float = 450.0  # search for air-blasts up to this range
+    infra_trigger_on: float = 5.0     # STA/LTA level for an infrasound (air pressure) trigger
+    min_snr_small: float = 6.0        # min signal/noise for 2-station detections
+    max_small_pair_km: float = 150.0  # 2-station detections only between stations this close
+    max_small_error_km: float = 100.0 # drop 2-3 station detections whose possible area is wider
+    max_trigger_rate: float = 30.0    # per station per hour; beyond this only the strongest are kept
+    # network stacking ("brightness") detector
+    stack_enabled: bool = True
+    stack_threshold: float = 2.0      # min brightness (sum of station excess STA/LTA minus the largest)
+    stack_mad_factor: float = 8.0     # ... and this many robust standard deviations above the background
+    stack_max_dist_km: float = 400.0  # stations farther than this from a trial source are ignored
+    stack_step_deg: float = 0.15      # grid spacing of trial sources
+    strong_signal_snr: float = 15.0   # unconfirmed single-station signals this strong are listed
 
 
 @dataclass
 class Settings:
     region: dict = field(default_factory=lambda: dict(DEFAULT_REGION))
+    polygon: list = field(default_factory=lambda: list(GULF_POLYGON))
+    station_buffer_km: float = 150.0   # also use stations up to this far outside the area
+    area_margin_km: float = 50.0       # events this close to the outline count as inside
     velocity: VelocityModel = field(default_factory=VelocityModel)
     detection: DetectionParams = field(default_factory=DetectionParams)

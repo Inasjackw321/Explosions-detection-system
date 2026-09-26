@@ -1,4 +1,4 @@
-"""Realistic simulated data for the demo mode.
+"""Simulated recordings - used ONLY by the test suite (the app uses real data only).
 
 Generates Raspberry-Shake-like and broadband seismograms (m/s) and
 Raspberry Shake & Boom infrasound (Pa) at sites around the Gulf, containing
@@ -13,10 +13,10 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from . import physics
-from .config import VelocityModel
-from .geo import azimuth_deg, haversine_km, KM_PER_DEG
-from .models import CatalogEvent, Station, Waveform
+from gulfseis import physics
+from gulfseis.config import VelocityModel
+from gulfseis.geo import azimuth_deg, haversine_km, KM_PER_DEG
+from gulfseis.models import CatalogEvent, Station, Waveform
 
 # code, site, lat, lon, kind, relative noise (cities are noisier)
 SIM_SITES = [

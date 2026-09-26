@@ -9,6 +9,7 @@ import numpy as np
 from . import discrimination as disc
 from . import physics
 from . import region as reg
+from . import stacking
 from .config import Settings
 from .detection import aic_pick, bandpass, detect_station, sta_lta
 from .geo import KM_PER_DEG, haversine_km
@@ -41,6 +42,8 @@ class AnalysisResult:
     t_end: float = 0.0
     messages: list = field(default_factory=list)
     infra_picks: list = field(default_factory=list)   # air-pressure trigger picks
+    stack: object = None                              # stacking.StackTrace (brightness vs time)
+    single_signals: list = field(default_factory=list)  # strong, unconfirmed 1-station signals
 
     @property
     def stations(self):
@@ -129,7 +132,15 @@ def analyze(waveforms: list[Waveform], settings: Settings | None = None,
             d = float(haversine_km(seed.station.lat, seed.station.lon, q.station.lat, q.station.lon))
             if q.time - seed.time <= d / vm.vp + 3.0:
                 cands[q.station.id] = q
-        if len(cands) < p.min_stations:
+        # quick pre-check: enough stations with a trigger that could be this
+        # event's P *or S* wave (S arrives later: distance / Vs)
+        reach = {seed.station.id}
+        for q in window[1:]:
+            if q.station.id not in reach:
+                d = float(haversine_km(seed.station.lat, seed.station.lon, q.station.lat, q.station.lon))
+                if q.time - seed.time <= d / vm.vs + 30.0:
+                    reach.add(q.station.id)
+        if len(reach) < p.min_stations:
             continue
         dist_ev = None
         if len(cands) >= max(p.min_stations, 5):
@@ -149,8 +160,8 @@ def analyze(waveforms: list[Waveform], settings: Settings | None = None,
             q.event_id = ev.id
         if ev.kind == "local":
             _refine_local(ev, res)
-            ev.in_region = bool(reg.contains(ev.lat, ev.lon, settings.polygon)) or \
-                reg.distance_km(ev.lat, ev.lon, settings.polygon) <= ev.error_km
+            ev.in_region = reg.in_area(ev.lat, ev.lon, settings.area_margin_km + ev.error_km,
+                                       settings.polygon)
         else:
             ev.in_region = False
             _consume_distant(ev, res)
@@ -171,10 +182,25 @@ def analyze(waveforms: list[Waveform], settings: Settings | None = None,
     # ---- 5. air-pressure (infrasound) events -------------------------------
     n_ev = _acoustic_events(res, n_ev)
 
-    # ---- 6. whatever is left is local noise --------------------------------
+    # ---- 6. network stacking: events too weak to trigger enough stations ----
+    #         (waves of the events found so far are masked out first)
+    if p.stack_enabled:
+        dets, res.stack = stacking.detect(res, [e for e in res.events if e.kind != "distant"],
+                                          [e for e in res.events if e.kind == "distant"])
+        for d in dets:
+            ev = _stack_event(d, res, n_ev + 1)
+            if ev is None:
+                continue
+            n_ev += 1
+            _measure_and_classify(ev, res)
+            _consume_air(ev, res)
+            res.events.append(ev)
+
+    # ---- 7. whatever is left is local noise --------------------------------
     for q in res.picks + res.infra_picks:
         if q.event_id is None:
             q.phase = "noise"
+    res.single_signals = strong_single_station(res)
     res.events.sort(key=lambda e: e.origin_time)
     return res
 
@@ -455,6 +481,8 @@ def _measure_and_classify(ev: DetectedEvent, res: AnalysisResult):
 
     if ev.ml_stations:
         ev.ml = float(np.median([m["ml"] for m in ev.ml_stations]))
+    if ev.error_km > 50:
+        log_ps = []      # the S window cannot be placed reliably without a good location
 
     # ---- air-blast search ---------------------------------------------------
     if ev.tier in ("acoustic", "single"):     # found from the air wave in the first place
@@ -539,6 +567,8 @@ def _tier_label(ev: DetectedEvent):
         ev.label = "Possible earthquake"
     note = {"small": f"Detected by only {ev.n_stations} seismic stations: the location is an area "
                      "(shaded on the map), not a point.",
+            "stack": f"Found by stacking {ev.n_stations} stations' signals along predicted travel times; "
+                     "some stations were too weak to trigger on their own. The location is an area.",
             "acoustic": "Located from the air-pressure (infrasound) arrivals.",
             "single": "Only one station: the distance comes from the delay between the ground "
                       "wave and the air wave; the direction is unknown (ring on the map)."}.get(ev.tier)
@@ -601,7 +631,7 @@ def _feasible(picks, s_picks, res, tol):
     S-P:  |(t_S - t_P) - (T_S - T_P)| <= 2 s + 5 %   at stations with an S candidate
     """
     vm = res.settings.velocity
-    LA, LO = reg.grid(0.05, tuple(res.settings.polygon))
+    LA, LO = reg.grid(0.05, tuple(res.settings.polygon), float(res.settings.area_margin_km))
     st_lat = np.array([q.station.lat for q in picks])
     st_lon = np.array([q.station.lon for q in picks])
     t = np.array([q.time for q in picks]) - picks[0].time
@@ -742,7 +772,7 @@ def _try_acoustic(group, res, num):
     picks = sorted((q for q in group if q.snr >= 5.0), key=lambda q: q.time)
     if len(picks) < 2 or max(q.snr for q in picks) < 8.0:
         return None
-    LA, LO = reg.grid(0.05, tuple(res.settings.polygon))
+    LA, LO = reg.grid(0.05, tuple(res.settings.polygon), float(res.settings.area_margin_km))
     st_lat = np.array([q.station.lat for q in picks])
     st_lon = np.array([q.station.lon for q in picks])
     t = np.array([q.time for q in picks]) - picks[0].time
@@ -754,6 +784,18 @@ def _try_acoustic(group, res, num):
     ok &= d.max(axis=1) <= p.max_air_range_km
     if not ok.any():
         return None
+    # stations that also recorded the ground wave: the ground-air delay gives the
+    # distance (d = dt / (1/c - 1/Vp)), which shrinks the possible area a lot
+    for k, q in enumerate(picks):
+        g = _ground_before_air(q, res)
+        if g is None:
+            continue
+        dt = q.time - g.time
+        d_lo = dt / (1 / p.celerity_min - 1 / vm.vp) - 5
+        d_hi = dt / (1 / p.celerity_max - 1 / vm.vp) + 5
+        ring = (d[:, k] >= d_lo) & (d[:, k] <= d_hi)
+        if (ok & ring).any():
+            ok &= ring
     c_mid = 0.5 * (p.celerity_min + p.celerity_max)
     t0 = t[None, :] - d / c_mid
     spread = np.where(ok, t0.max(axis=1) - t0.min(axis=1), np.inf)
@@ -769,6 +811,20 @@ def _try_acoustic(group, res, num):
     ev.air_picks = list(picks)
     ev.picks = _ground_wave(ev, res, 3.0 + min(err, 100.0) / vm.vp)
     return ev
+
+
+def _ground_before_air(q, res, max_d=None):
+    """The strongest free seismic trigger at the same station that could be the
+    ground wave of the air arrival q (None if the station has no seismometer)."""
+    p, vm = res.settings.detection, res.settings.velocity
+    st = res.traces.get(q.station.id)
+    if st is None or st.seismic is None:
+        return None
+    max_d = max_d or p.max_air_range_km
+    dt_max = max_d * (1 / p.celerity_min - 1 / vm.vp)
+    cands = [g for g in res.picks if g.station.id == q.station.id and g.event_id is None
+             and g.snr >= 5.0 and 1.0 <= q.time - g.time <= dt_max]
+    return max(cands, key=lambda g: g.snr) if cands else None
 
 
 def _try_single(seed, res, num):
@@ -792,7 +848,7 @@ def _try_single(seed, res, num):
     dt = seed.time - g.time
     d_lo = dt / (1 / p.celerity_min - 1 / vm.vp)
     d_hi = dt / (1 / p.celerity_max - 1 / vm.vp)
-    LA, LO = reg.grid(0.05, tuple(res.settings.polygon))
+    LA, LO = reg.grid(0.05, tuple(res.settings.polygon), float(res.settings.area_margin_km))
     dist = haversine_km(seed.station.lat, seed.station.lon, LA, LO)
     ok = (dist >= d_lo - 3) & (dist <= d_hi + 3)
     if not ok.any():
@@ -807,3 +863,79 @@ def _try_single(seed, res, num):
     seed.event_id, seed.phase = ev.id, "Air"
     ev.air_picks = [seed]
     return ev
+
+
+# ---------------------------------------------------------------------------
+# Events found by the stacking detector
+# ---------------------------------------------------------------------------
+def _stack_event(d, res, num):
+    vm = res.settings.velocity
+    ev = DetectedEvent(id=f"EV{num:03d}", kind="local", origin_time=d.time, lat=d.lat, lon=d.lon,
+                       depth=0.0, depth_min=0.0, depth_max=40.0, error_km=d.error_km, tier="stack")
+    ev.feasible_lat, ev.feasible_lon = d.area_lat, d.area_lon
+    picks, conflicts = [], 0
+    slack = 2.0 + min(d.error_km, 100.0) / vm.vp
+    for sid, (val, ph) in d.contributions.items():
+        st = res.traces[sid]
+        dist = float(haversine_km(d.lat, d.lon, st.station.lat, st.station.lon))
+        tp = d.time + float(physics.p_time(dist, 0.0, vm))
+        ts = d.time + float(physics.s_time(dist, 0.0, vm))
+        t_pred = tp if ph == "P" else ts
+        near = [q for q in res.picks if q.station.id == sid and abs(q.time - t_pred) <= slack]
+        if any(q.event_id is not None for q in near):
+            conflicts += 1
+            continue
+        if near:
+            q = max(near, key=lambda q: q.snr)
+            q.phase = ph
+        else:   # the station did not trigger by itself: mark the predicted arrival
+            q = Pick(st.station, t_pred, ph, snr=val, peak_ratio=val, channel=st.seismic.channel)
+        q.event_id, q.residual = ev.id, float(q.time - t_pred)
+        picks.append(q)
+    if len(picks) < 2 or conflicts > len(picks):
+        for q in picks:
+            if q in res.picks:
+                q.event_id, q.phase = None, "?"
+        return None
+    ev.picks = picks
+    ev.rms = float(np.sqrt(np.mean([q.residual ** 2 for q in picks])))
+    ev.in_region = reg.in_area(d.lat, d.lon, res.settings.area_margin_km, res.settings.polygon)
+    # absorb the rest of the wave train at the supporting stations
+    for q in res.picks:
+        if q.event_id is None and q.station.id in d.contributions:
+            dist = float(haversine_km(d.lat, d.lon, q.station.lat, q.station.lon))
+            tp = d.time + float(physics.p_time(dist, 0.0, vm))
+            ts = d.time + float(physics.s_time(dist, 0.0, vm))
+            if tp - slack <= q.time <= ts + slack + max(15.0, 0.6 * (ts - tp)):
+                q.event_id, q.phase = ev.id, "coda"
+    return ev
+
+
+# ---------------------------------------------------------------------------
+# Strong signals that only one station recorded
+# ---------------------------------------------------------------------------
+def strong_single_station(res: AnalysisResult) -> list[dict]:
+    """Noise triggers that are very strong.  They cannot be confirmed (no other
+    station saw them), but if a second, later arrival follows within a minute it
+    may be the S wave, and the S-P time gives a distance:  d = dt * Vp*Vs/(Vp-Vs)."""
+    p, vm = res.settings.detection, res.settings.velocity
+    out = []
+    used = set()
+    for q in res.picks:
+        if q.event_id is not None or id(q) in used or q.snr < 5.0:
+            continue
+        later = [x for x in res.picks if x.station.id == q.station.id and x.event_id is None
+                 and 1.5 <= x.time - q.time <= 60.0 and x.snr >= 3.0]
+        s_wave = min(later, key=lambda x: x.time) if later else None
+        # listed if very strong, or if a clear second arrival follows (a P + S pair
+        # is typical of a real seismic source, rarely of traffic or machinery)
+        pair = s_wave is not None and s_wave.snr >= 4.0 and s_wave.time - q.time >= 2.0
+        if q.snr < p.strong_signal_snr and not pair:
+            continue
+        sp = s_wave.time - q.time if s_wave is not None else None
+        if s_wave is not None:
+            used.add(id(s_wave))
+        out.append({"pick": q, "station": q.station, "time": q.time, "snr": q.snr, "pair": pair,
+                    "peak_um_s": q.amplitude * 1e6, "duration_s": q.duration, "sp_s": sp,
+                    "dist_km": physics.sp_distance_km(sp, vm.vp, vm.vs) if sp else None})
+    return out

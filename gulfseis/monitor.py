@@ -37,6 +37,8 @@ class MonitorResult:
     triggers_total: dict = field(default_factory=dict)
     messages: list = field(default_factory=list)
     focus: tuple | None = None            # (lat, lon, time) of an event the user asked to check
+    single_signals: list = field(default_factory=list)   # strong unconfirmed 1-station signals
+    stack: list = field(default_factory=list)            # [(t0, rate, brightness, threshold)] per part
 
     @property
     def in_region(self):
@@ -142,6 +144,12 @@ def run(fetcher, t_start, t_end, settings: Settings, catalog=None, progress=None
         out.picks += [q for q in res.picks if mine(q)]
         out.infra_picks += [q for q in res.infra_picks if mine(q)]
         out.events += keep
+        out.single_signals += [x for x in res.single_signals if lo <= x["time"] < ce]
+        if res.stack is not None:
+            st_ = res.stack
+            i1 = max(int((lo - st_.t0) * st_.rate), 0)
+            i2 = max(int((ce - st_.t0) * st_.rate), 0)
+            out.stack.append((st_.t0 + i1 / st_.rate, st_.rate, st_.bmax[i1:i2], st_.threshold))
         for sid, st in res.traces.items():
             out.triggers_total[sid] = out.triggers_total.get(sid, 0) + st.triggers_total + st.infra_triggers_total
             ov = _overview(st, cs, ce)

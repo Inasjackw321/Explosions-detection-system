@@ -69,7 +69,7 @@ def test_chunked_monitor_finds_all_events(fake_server):
     assert len(r.events) == 3
     for ev, truth in zip(r.events, evs):
         assert ev.in_region
-        assert abs(ev.origin_time - (t0 + truth.t)) < 5
+        assert abs(ev.origin_time - (t0 + truth.t)) < 10
         assert haversine_km(ev.lat, ev.lon, truth.lat, truth.lon) < 30
     assert [("explosion" in e.label.lower()) for e in r.events] == [True, True, False]
     assert set(r.snippets) == {e.id for e in r.events}

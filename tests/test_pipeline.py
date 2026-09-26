@@ -64,3 +64,37 @@ def test_quake_outside_area_is_not_reported_inside(seed):
     _, wfs, cat, _ = sim.generate([E("earthquake", 100, 25.0, 56.0, 15, 3.0, strike=30)], seed=seed)
     res = analyze(wfs, catalog=cat)
     assert not [e for e in res.events if e.in_region]
+
+
+# a sparse network like the real one at the head of the Gulf: one seismometer
+# near Kuwait (Basrah), the rest 250-700 km away, no infrasound
+SPARSE = {"BSRA", "MANA", "DAMM", "BUSH", "DOHA", "KISH", "ABUD"}
+
+
+def _sparse(evs, seed):
+    _, wfs, cat, _ = sim.generate(evs, seed=seed, duration=1500)
+    return analyze([w for w in wfs if w.station.code in SPARSE and w.units != "Pa"], catalog=cat)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_stacking_finds_kuwait_blast_with_sparse_stations(seed):
+    """ML 2.8 near Kuwait: too few stations trigger for the classic locator, but the
+    stacking detector must find it inside the area, near the right place."""
+    res = _sparse([E("explosion", 200, 29.3, 47.9, 0, 2.8)], seed)
+    found = [e for e in res.events if e.in_region]
+    assert found and found[0].tier == "stack"
+    assert haversine_km(found[0].lat, found[0].lon, 29.3, 47.9) < 60
+    assert "earthquake" not in found[0].label.lower()
+
+
+def test_single_station_p_s_pair_is_listed():
+    """ML 2.0 seen only at Basrah: not an event, but listed as an unconfirmed
+    single-station signal with the S-P distance."""
+    res = _sparse([E("explosion", 300, 29.75, 48.35, 0, 2.0)], 2)
+    hits = [x for x in res.single_signals if x["station"].code == "BSRA" and x["dist_km"]]
+    assert hits and abs(hits[0]["dist_km"] - 99) < 25
+
+
+def test_sparse_noise_only_is_quiet():
+    res = _sparse([], 4)
+    assert res.events == []

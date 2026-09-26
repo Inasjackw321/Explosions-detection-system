@@ -66,6 +66,13 @@ class DetectionParams:
     max_small_pair_km: float = 150.0  # 2-station detections only between stations this close
     max_small_error_km: float = 100.0 # drop 2-3 station detections whose possible area is wider
     max_trigger_rate: float = 30.0    # per station per hour; beyond this only the strongest are kept
+    # network stacking ("brightness") detector
+    stack_enabled: bool = True
+    stack_threshold: float = 2.0      # min brightness (sum of station excess STA/LTA minus the largest)
+    stack_mad_factor: float = 8.0     # ... and this many robust standard deviations above the background
+    stack_max_dist_km: float = 400.0  # stations farther than this from a trial source are ignored
+    stack_step_deg: float = 0.15      # grid spacing of trial sources
+    strong_signal_snr: float = 15.0   # unconfirmed single-station signals this strong are listed
 
 
 @dataclass
@@ -73,5 +80,6 @@ class Settings:
     region: dict = field(default_factory=lambda: dict(DEFAULT_REGION))
     polygon: list = field(default_factory=lambda: list(GULF_POLYGON))
     station_buffer_km: float = 150.0   # also use stations up to this far outside the area
+    area_margin_km: float = 50.0       # events this close to the outline count as inside
     velocity: VelocityModel = field(default_factory=VelocityModel)
     detection: DetectionParams = field(default_factory=DetectionParams)

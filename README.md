@@ -12,9 +12,11 @@ one of these:
 Events whose source is outside the area, such as inland Zagros or distant earthquakes, are listed
 separately.
 
-The **monitored area** is the green outline: from Kuwait along the head of the Gulf, down the Iranian
-coast to the Strait of Hormuz and the Gulf of Oman (Sohar), then back along the UAE, Qatar, Bahrain and
-Saudi coasts. It is defined in `gulfseis/region.py`.
+The **monitored area** is the green outline. It covers all of Kuwait and the head of the Gulf
+(Basrah, Faw, Abadan, Bandar Mahshahr), runs down the Iranian coast to the Strait of Hormuz and the Gulf
+of Oman (Sohar), then back along the UAE, Qatar, Bahrain and Saudi coasts. By default, events up to
+50 km beyond the outline also count; you can change this in the sidebar. The outline is defined in
+`gulfseis/region.py`.
 
 ## Open the app
 
@@ -65,6 +67,17 @@ to 50 Hz. Long periods are processed in 1-hour chunks with overlap, so slow air 
    - Infrasound: the air wave arriving at microphones is located at the speed of sound.
    - One Raspberry Shake & Boom: the delay between the ground wave and the air wave gives the distance,
      d = Δt / (1/c − 1/Vp). It cannot give the direction.
+   - **Network stacking (brightness)**, for events too weak to trigger enough stations. Every station's
+     STA/LTA is shifted by the predicted P and S travel times from each trial source and added up.
+     Subtracting the largest term means one station alone can never make an event:
+
+         B(x,t) = Σᵢ [cᵢ(t+T_P,i) + cᵢ(t+T_S,i)] − maxᵢ(…)
+
+     A peak above the threshold, with support from 3 stations (or 2 stations that each show both a P and
+     an S wave), is an event, even if no station triggered on its own.
+   - One station only: very strong signals, or a P then S pair, are listed as **unconfirmed
+     single-station signals**. The S–P time gives a possible distance (d ≈ 8.3 km per second of
+     S−P), drawn as a ring on the map.
 4. **Explosion or earthquake**: the evidence is combined with P = 1/(1+e^−z). It comes from the air
    wave, the P/S amplitude ratio, depth, first motion, a catalogue match and the time of day. Events
    seen by few stations are labelled "Possible".
@@ -88,6 +101,7 @@ gulfseis/
   data_sources.py       FDSN station search, download, response removal, catalogues
   monitor.py            chunked processing of long periods
   pipeline.py           detect → associate → locate → classify (network, small, air, single)
+  stacking.py           network stacking ("brightness") detector
   detection.py          filters, STA/LTA, AIC picker, first motion
   location.py           grid-search and distant-event locators
   discrimination.py     explosion vs earthquake evidence
@@ -102,7 +116,9 @@ real data.
 
 ## Limitations
 
-- Public station coverage around the Gulf is uneven. Small blasts are only seen by nearby stations.
+- Public station coverage around the Gulf is uneven. At the head of the Gulf only a few stations
+  (for example Basrah) may be online. An event that only one station recorded cannot be located, and
+  appears as an unconfirmed single-station signal.
 - Locations from 2–3 stations are areas, and single-station detections give only a distance.
 - An air-only detection can also be thunder, a sonic boom or another loud sound.
 - Yield estimates are order-of-magnitude. Confirm important events with official agencies (KNSN, IRSC,

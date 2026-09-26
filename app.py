@@ -123,6 +123,9 @@ def sidebar():
     cfg["infrasound"] = sb.checkbox("Use infrasound (Raspberry Shake & Boom)", True)
     s = Settings()
     s.station_buffer_km = sb.slider("Also use stations up to … km outside the area", 0, 400, 150, 25)
+    s.area_margin_km = sb.slider("Count events up to … km outside the outline", 0, 200, 50, 10,
+                                 help="The outline is hand-drawn; events just beyond it (e.g. inland "
+                                      "Kuwait, southern Iraq, the Iranian coast) are still reported.")
     cfg["max_stations"] = sb.slider("Max stations", 5, 150, 80)
     cfg["catalog"] = sb.checkbox("Cross-check with USGS/EMSC catalogues", True)
 
@@ -133,8 +136,10 @@ def sidebar():
                             value=default_sens, key=f"sens_{mode}")
     if sens.startswith("High"):
         p.trigger_on, p.infra_trigger_on, p.min_snr_small, p.small_min_stations = 3.5, 4.0, 4.0, 2
+        p.stack_threshold, p.stack_mad_factor, p.strong_signal_snr = 1.5, 6.0, 10.0
     elif sens.startswith("Low"):
         p.trigger_on, p.infra_trigger_on, p.min_snr_small, p.small_min_stations = 5.0, 6.0, 8.0, 3
+        p.stack_threshold, p.stack_mad_factor, p.strong_signal_snr = 3.0, 10.0, 25.0
     with sb.expander("Advanced trigger settings"):
         p.freqmin, p.freqmax = st.slider("Band-pass filter (Hz)", 0.5, 20.0, (p.freqmin, p.freqmax), 0.5)
         p.sta = st.slider("STA window (s)", 0.2, 5.0, p.sta, 0.1)
@@ -147,6 +152,13 @@ def sidebar():
         p.max_trigger_rate = st.slider("Max triggers per station per hour", 5, 200, int(p.max_trigger_rate), 5,
                                        help="Very noisy stations (traffic, machinery) keep only their "
                                             "strongest triggers.")
+        p.stack_enabled = st.checkbox("Network stacking detector", p.stack_enabled,
+                                      help="Adds up all stations along predicted travel times, so events "
+                                           "too weak to trigger enough stations are still found.")
+        p.stack_threshold = st.slider("Stacking: minimum brightness", 0.5, 6.0, p.stack_threshold, 0.25)
+        p.stack_mad_factor = st.slider("Stacking: × background spread", 3.0, 15.0, p.stack_mad_factor, 0.5)
+        p.strong_signal_snr = st.slider("List single-station signals stronger than (signal/noise)",
+                                        5.0, 50.0, p.strong_signal_snr, 1.0)
     vm = VelocityModel()
     with sb.expander("Earth & air model"):
         vm.vp = st.number_input("Crust P speed Vp (km/s)", 5.0, 7.0, vm.vp, 0.05)
@@ -263,6 +275,7 @@ def fmt_tons(t):
 
 
 TIER_TEXT = {"network": "located by the seismic network", "small": "2–3 seismic stations (area only)",
+             "stack": "network stacking (weak signals added up; area only)",
              "acoustic": "located from air-pressure (infrasound) arrivals",
              "single": "one station: ground wave + air wave", "distant": "distant earthquake"}
 
@@ -300,6 +313,23 @@ def header(R):
                 "as local noise (see the *Timeline & noise* and *Stations & data* tabs).")
     for ev in ins:
         event_card(ev)
+    strong = [x for x in R.single_signals if reg.in_area(x["station"].lat, x["station"].lon,
+                                                           R.settings.station_buffer_km, R.settings.polygon)]
+    if strong:
+        with st.expander(f"⚠️ {len(strong)} clear signal(s) seen by only ONE station (unconfirmed)"):
+            st.caption("Very strong signals, or a P wave followed by an S wave, that no other station confirms, "
+                       "so they cannot be located. "
+                       "They may be a nearby event that only this station recorded (sparse coverage), or "
+                       "very local noise (vehicle, machinery, door). If a second, later arrival (possible S "
+                       "wave) was seen, the S–P time gives a distance (dashed ring on the map).")
+            st.dataframe(pd.DataFrame([{
+                "Time": tfmt(x["time"]), "Station": x["station"].id, "Site": x["station"].site,
+                "Signal/noise": round(x["snr"], 1), "Peak (µm/s)": round(x["peak_um_s"], 3),
+                "Duration (s)": round(x["duration_s"], 1),
+                "Second arrival": "yes (P+S pair)" if x.get("pair") else ("weak" if x["sp_s"] else "no"),
+                "S–P (s)": None if x["sp_s"] is None else round(x["sp_s"], 1),
+                "Possible distance (km)": None if x["dist_km"] is None else round(x["dist_km"])}
+                for x in strong]), hide_index=True, width="stretch")
     if R.outside:
         with st.expander(f"{len(R.outside)} event(s) outside the monitored area"):
             for ev in R.outside:
@@ -325,10 +355,18 @@ def focus_card(R):
         st.markdown(f"**🔎 Your event: {tfmt(t0)}" + (f", near {describe(lat, lon)}**" if lat is not None else "**"))
         near = [e for e in R.events if abs(e.origin_time - t0) <= 900
                 and (lat is None or haversine_km(lat, lon, e.lat, e.lon) <= 150 + e.error_km)]
+        singles = [x for x in R.single_signals if abs(x["time"] - t0) <= 900
+                   and (lat is None or haversine_km(lat, lon, x["station"].lat, x["station"].lon) <= 300)]
         if near:
             for e in near:
                 st.success(f"Found: **{event_title(e)}** at {tfmt(e.origin_time, False)} "
                            f"({e.origin_time - t0:+.0f} s from your time).")
+        elif singles:
+            for x in singles:
+                dist = f", possible distance {x['dist_km']:.0f} km (S–P {x['sp_s']:.1f} s)" if x["dist_km"] else ""
+                st.info(f"Only one station recorded a clear signal: **{x['station'].id}** "
+                        f"({x['station'].site}) at {tfmt(x['time'], False)}, signal/noise {x['snr']:.0f}{dist}. "
+                        "No other station confirmed it, so it cannot be located or classified with confidence.")
         else:
             st.warning("Nothing was detected close to this time and place. The table shows what each "
                        "station recorded around the moment the waves should have arrived (±3 min, since "
@@ -374,7 +412,7 @@ def map_tab(R):
     s = R.settings
     wide = st.radio("View", ["Monitored area", "Wide (includes distant events)"], horizontal=True,
                     key="map_view").startswith("Wide")
-    show_out = st.checkbox("Show events outside the area", value=False, key="map_out")
+    show_out = st.checkbox("Show events outside the area (faded)", value=True, key="map_out")
     fig = go.Figure()
     poly = s.polygon + [s.polygon[0]]
     fig.add_trace(go.Scattergeo(lat=[p[0] for p in poly], lon=[p[1] for p in poly], mode="lines",
@@ -382,7 +420,7 @@ def map_tab(R):
     events = [e for e in R.events if e.in_region or show_out]
     for ev in events:
         color = EVENT_COLORS.get(ev.label, "#8a8984")
-        if ev.feasible_lat and ev.tier in ("small", "acoustic", "single"):
+        if ev.feasible_lat and ev.tier in ("small", "acoustic", "single", "stack"):
             fig.add_trace(go.Scattergeo(lat=ev.feasible_lat, lon=ev.feasible_lon, mode="markers",
                                         marker=dict(size=4, color=color, opacity=0.25), hoverinfo="skip",
                                         showlegend=False))
@@ -442,10 +480,25 @@ def map_tab(R):
         fig.add_trace(go.Scattergeo(
             lat=[e.lat for e in evs], lon=[e.lon for e in evs], mode="markers", name=label,
             marker=dict(size=[12 + 5 * (e.ml if e.ml is not None else 2) for e in evs], color=color,
+                        opacity=[1.0 if e.in_region else 0.4 for e in evs],
                         symbol="star" if label in EXPLOSIVE else "circle", line=dict(width=2, color="white")),
             hovertext=[f"<b>{e.id} {e.label}</b><br>{tfmt(e.origin_time)}<br>{mag_text(e)}"
                        f"<br>{TIER_TEXT.get(e.tier, '')}" for e in evs], hoverinfo="text"))
 
+    if R.single_signals:
+        xs = R.single_signals
+        fig.add_trace(go.Scattergeo(
+            lat=[x["station"].lat for x in xs], lon=[x["station"].lon for x in xs], mode="markers",
+            name="Strong signal at 1 station", marker=dict(size=22, symbol="circle-open", color="#eda100",
+                                                          line=dict(width=3)),
+            hovertext=[f"{x['station'].id}: signal/noise {x['snr']:.0f} at {tfmt(x['time'])}"
+                       + (f"<br>possible distance {x['dist_km']:.0f} km" if x["dist_km"] else "") for x in xs],
+            hoverinfo="text"))
+        for x in xs:
+            if x["dist_km"]:
+                la, lo = circle_polygon(x["station"].lat, x["station"].lon, x["dist_km"], 90)
+                fig.add_trace(go.Scattergeo(lat=la, lon=lo, mode="lines", hoverinfo="skip", showlegend=False,
+                                            line=dict(width=1.5, color="#eda100", dash="dash")))
     if R.focus and R.focus[0] is not None:
         fig.add_trace(go.Scattergeo(lat=[R.focus[0]], lon=[R.focus[1]], mode="markers", name="Your reference point",
                                     marker=dict(size=16, symbol="x", color="#e34948")))
@@ -464,10 +517,12 @@ def map_tab(R):
                       legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0))
     # basemap served locally (static/topojson) so the map also works offline
     st.plotly_chart(fig, width="stretch", config={"topojsonURL": "app/static/topojson/"})
-    st.caption("Green outline = monitored area. ▲ seismometer · ◆ with infrasound microphone · open symbol = "
-               "no data returned. ★ explosion · ● earthquake. Dotted ring = 95% location uncertainty; "
-               "shaded dots = possible source area when only a few stations detected it; dashed rings = "
-               "distance range from a single station (direction unknown).")
+    st.caption("Green outline = monitored area (events up to "
+               f"{s.area_margin_km:g} km beyond it also count). ▲ seismometer · ◆ with infrasound microphone · "
+               "open symbol = no data returned. ★ explosion · ● earthquake · faded = outside the area. Dotted "
+               "ring = 95% location uncertainty; shaded dots = possible source area when only a few stations "
+               "detected it; dashed rings = distance from a single station (direction unknown). Orange circle = "
+               "strong signal that only one station recorded.")
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +544,10 @@ def timeline_tab(R):
         if m > 0:
             Z[k, i0:i0 + m] = np.log10(np.maximum(arr[:m] * 1e9, 1e-3))
     times = [local_dt(t_min + i * dt) for i in range(n)]
+    finite = Z[np.isfinite(Z)]
+    zmin, zmax = (np.percentile(finite, [2, 99.5]) if finite.size else (0, 1))
     fig = go.Figure(go.Heatmap(z=Z, x=times, y=ids, colorscale="Blues", colorbar=dict(title="log₁₀ nm/s"),
+                               zmin=float(zmin), zmax=float(zmax),
                                hoverongaps=False, hovertemplate="%{y}<br>%{x}<br>10^%{z:.1f} nm/s<extra></extra>"))
     noise = [q for q in R.noise_picks if q.station.id in ids]
     if noise:
@@ -506,6 +564,24 @@ def timeline_tab(R):
                "Grey ticks = noise triggers (one station only). Dashed lines = detected events. "
                "Noise shows up at one station at a time (traffic, machinery, people); a real event "
                "appears at several stations within seconds to minutes.")
+    if R.stack:
+        fig = go.Figure()
+        for k, (t0, rate, b, thr) in enumerate(R.stack):
+            x = [local_dt(t0 + i / rate) for i in range(0, len(b), 4)]
+            fig.add_trace(go.Scattergl(x=x, y=b[::4], mode="lines", line=dict(width=1, color="#2a78d6"),
+                                       name="Network brightness" if k == 0 else None, showlegend=k == 0))
+            fig.add_trace(go.Scatter(x=[x[0], x[-1]] if x else [], y=[thr, thr], mode="lines",
+                                     line=dict(color="#e34948", dash="dash", width=1),
+                                     name="Detection threshold" if k == 0 else None, showlegend=k == 0))
+        for e in R.events:
+            if e.tier == "stack":
+                fig.add_vline(x=local_dt(e.origin_time), line=dict(color=EVENT_COLORS.get(e.label), width=2, dash="dot"))
+        fig.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=30), title="Network stacking brightness B(t)",
+                          xaxis_title=f"Time ({tz_label()})", legend=dict(orientation="h", y=1.15))
+        st.plotly_chart(fig, width="stretch")
+        st.caption("All stations' STA/LTA added up along the travel times from the best trial source "
+                   "(see Formulas ⑧). A peak above the red line with support from ≥ 3 stations (or 2 stations "
+                   "with both P and S) is an event, even if no station triggered by itself.")
     hours = max((R.t_end - R.t_start) / 3600, 0.01)
     rows = [{"Station": sid, "Noise triggers": sum(1 for q in R.noise_picks if q.station.id == sid)} for sid in ids]
     for r in rows:
@@ -889,6 +965,18 @@ def formulas_tab(R):
                     f"≈ {60 / (1 / 0.31 - 1 / vm.vp):.0f} km of distance, so a Raspberry Shake & Boom can range an "
                     "explosion on its own (but cannot tell the direction).")
         st.latex(r"c = 331.3\sqrt{1+T/273.15}\ \text{m/s}")
+    with st.expander("⑧ Network stacking: finding events too weak for single-station triggers", expanded=True):
+        st.latex(r"c_i(t)=\min\big(\max(R_i(t)-q_i,\,0),\,5\big)\qquad "
+                 r"s_i(\mathbf{x},t)=c_i\big(t+T_{P,i}(\mathbf{x})\big)+c_i\big(t+T_{S,i}(\mathbf{x})\big)")
+        st.latex(r"B(\mathbf{x},t)=\sum_i s_i(\mathbf{x},t)-\max_i s_i(\mathbf{x},t)\qquad "
+                 r"\text{event if }\ \max_{\mathbf{x}}B>\max\big(B_0,\ \mathrm{median}+k\cdot1.4826\,\mathrm{MAD}\big)")
+        st.markdown(f"R_i is station i's STA/LTA and q_i its own 90th percentile, so busy stations don't "
+                    f"dominate. For every trial source **x** (a {p.stack_step_deg:g}° grid) and origin time t, the "
+                    "stations' values at the predicted P and S arrival times are added. A real event lines up "
+                    "across stations; noise at one station does not, and subtracting the largest term means "
+                    f"one station alone can never make an event. B₀ = {p.stack_threshold:g}, k = "
+                    f"{p.stack_mad_factor:g}; support from ≥ 3 stations, or 2 stations that both show P and S, "
+                    "is required. Waves of events already found are masked out first.")
     with st.expander("⑥ Magnitude, energy and yield"):
         st.latex(r"M_L=\log_{10}A+1.11\log_{10}R+0.00189R-2.09,\qquad \log_{10}E=1.5M+4.8,\qquad "
                  r"Y_{kt}=10^{(M-4.45)/0.75}/\varepsilon")
